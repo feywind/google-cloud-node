@@ -1,0 +1,49 @@
+{
+  "name": "@google-cloud/utils",
+  "description": "Google Cloud client libraries small utility functions",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "author": "Google LLC",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "repository": "googleapis/google-cloud-node",
+  "main": "./build/src/index.js",
+  "keywords": [
+    "google apis client",
+    "google api client",
+    "google apis",
+    "google api",
+    "google",
+    "google cloud platform",
+    "google cloud",
+    "cloud"
+  ],
+  "files": [
+    "build/src"
+  ],
+  "scripts": {
+    "compile": "tsc -p .",
+    "prepare": "npm run compile",
+    "pretest": "npm run compile",
+    "test": "c8 mocha build/test --recursive",
+    "snapshots-update": "SNAPSHOT_UPDATE=1 npm test",
+    "samples-test": "echo no system tests yet 🙀",
+    "system-test": "echo no system tests yet 🙀",
+    "lint": "gts check",
+    "fix": "gts fix"
+  },
+  "dependencies": {
+  },
+  "devDependencies": {
+    "@types/mocha": "^9.1.1",
+    "@types/node": "^18.0.0",
+    "@types/sinon": "^10.0.13",
+    "c8": "^8.0.0",
+    "gts": "^5.0.0",
+    "mocha": "^10.0.0",
+    "sinon": "^16.0.0",
+    "snap-shot-it": "^7.9.6",
+    "typescript": "^5.1.6"
+  }
+}
