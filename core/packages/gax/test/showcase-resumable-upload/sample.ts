@@ -13,25 +13,91 @@
 // limitations under the License.
 
 // Runs end-to-end resumable upload tests against the gapic-showcase
-// ResumableUploadService using the generated client in ./client.
+// ResumableUploadService using the generated client in ./fixtures.
 
-'use strict';
-
-const assert = require('assert');
-const crypto = require('crypto');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const {Readable} = require('stream');
-const {GoogleAuth, googleAuthLibrary} = require('google-gax');
-const {ResumableUploadServiceClient} = require('./fixtures');
+import assert from 'assert';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import {createRequire} from 'module';
+import * as os from 'os';
+import * as path from 'path';
+import {Readable} from 'stream';
+import {
+  ClientOptions,
+  GoogleAuth,
+  googleAuthLibrary,
+  ResumableSource,
+  ResumableUploadSession,
+} from '../../src';
 
 const GRANULARITY = 256 * 1024; // 256 KiB server chunk granularity
+
+interface UploadMediaRequest {
+  name?: string;
+}
+
+interface UploadMediaResponse {
+  size?: number | string;
+}
+
+interface ShowcaseResumableUploadClient {
+  apiEndpoint: string;
+  getResumableSource(filePath: string): ResumableSource;
+  uploadMedia(request?: UploadMediaRequest): Promise<ResumableUploadSession>;
+  close(): Promise<void>;
+}
+
+interface ShowcaseFixturesModule {
+  ResumableUploadServiceClient: new (
+    opts?: ClientOptions,
+  ) => ShowcaseResumableUploadClient;
+}
+
+interface TempPayload {
+  filePath: string;
+  size: number;
+  data: Buffer;
+  cleanup(): void;
+}
+
+interface RequestLogEntry {
+  command: string | undefined;
+  offset: number;
+  status: number;
+  bodyLength: number;
+}
+
+interface UploadRequestOptions {
+  headers?: Record<string, string | undefined>;
+  body?: string | Uint8Array;
+}
+
+interface RequestHookContext {
+  command: string | undefined;
+  offset: number;
+  log: RequestLogEntry[];
+}
+
+type RequestHook = (
+  opts: UploadRequestOptions,
+  context: RequestHookContext,
+) => void | Promise<void>;
+
+const localRequire = createRequire(__filename);
+const fixturesPath = fs.existsSync(path.join(__dirname, 'fixtures'))
+  ? path.join(__dirname, 'fixtures')
+  : path.resolve(__dirname, '../../../test/showcase-resumable-upload/fixtures');
+const {ResumableUploadServiceClient} = localRequire(
+  fixturesPath,
+) as ShowcaseFixturesModule;
 
 /**
  * Helper to create a temporary payload file with random bytes.
  */
-function createTempPayload(size, prefix = 'showcase-test-') {
+function createTempPayload(
+  size: number,
+  prefix = 'showcase-test-',
+): TempPayload {
   const filePath = path.join(
     os.tmpdir(),
     `${prefix}${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.bin`,
@@ -45,7 +111,7 @@ function createTempPayload(size, prefix = 'showcase-test-') {
     cleanup() {
       try {
         fs.unlinkSync(filePath);
-      } catch (_err) {
+      } catch {
         // ignore cleanup errors
       }
     },
@@ -55,9 +121,12 @@ function createTempPayload(size, prefix = 'showcase-test-') {
 /**
  * Helper to create a ResumableUploadServiceClient pointing at the showcase server.
  */
-function createClient(port, customAuth) {
+function createClient(
+  port: number,
+  customAuth?: GoogleAuth,
+): ShowcaseResumableUploadClient {
   const auth =
-    customAuth ||
+    customAuth ??
     new GoogleAuth({
       authClient: new googleAuthLibrary.PassThroughClient(),
     });
@@ -70,9 +139,22 @@ function createClient(port, customAuth) {
 }
 
 /**
+ * Extracts the committed byte size from a finished UploadMedia response.
+ */
+async function getFinishedSize(
+  session: ResumableUploadSession,
+): Promise<number> {
+  const response = (await session.finished()) as UploadMediaResponse;
+  return Number(response.size);
+}
+
+/**
  * Baseline upload of UPLOAD_FILE if provided by run.sh.
  */
-async function runBaselineUpload(port, filePath) {
+async function runBaselineUpload(
+  port: number,
+  filePath: string,
+): Promise<void> {
   console.log('\n=== Baseline Upload (from UPLOAD_FILE) ===');
   const size = fs.statSync(filePath).size;
   const client = createClient(port);
@@ -94,7 +176,7 @@ async function runBaselineUpload(port, filePath) {
     });
 
     console.log(`Upload session: ${session.uploadUrl}`);
-    const response = await session.finished();
+    const response = (await session.finished()) as UploadMediaResponse;
     const uploadedSize = Number(response.size);
     assert.strictEqual(
       uploadedSize,
@@ -111,7 +193,7 @@ async function runBaselineUpload(port, filePath) {
  * Test 1: Multi-block upload
  * Uploads a payload spanning multiple 256 KiB blocks plus a partial final block.
  */
-async function testMultiBlockUpload(port) {
+async function testMultiBlockUpload(port: number): Promise<void> {
   console.log('\n=== Test 1: Multi-block Upload ===');
   // 4 full 256 KiB blocks + 100 KiB partial block = 1,126,400 bytes
   const size = 4 * GRANULARITY + 100 * 1024;
@@ -122,7 +204,7 @@ async function testMultiBlockUpload(port) {
     const session = await client.uploadMedia({
       name: path.basename(payload.filePath),
     });
-    const progressUpdates = [];
+    const progressUpdates: number[] = [];
 
     await session.start({
       uploadSource: client.getResumableSource(payload.filePath),
@@ -135,8 +217,7 @@ async function testMultiBlockUpload(port) {
       },
     });
 
-    const response = await session.finished();
-    const uploadedSize = Number(response.size);
+    const uploadedSize = await getFinishedSize(session);
 
     assert.strictEqual(
       uploadedSize,
@@ -166,7 +247,7 @@ async function testMultiBlockUpload(port) {
  * Test 2: Smaller than one block upload
  * Uploads a 64 KiB payload when chunkSize is 512 KiB (single `upload, finalize`).
  */
-async function testSmallerThanOneBlockUpload(port) {
+async function testSmallerThanOneBlockUpload(port: number): Promise<void> {
   console.log('\n=== Test 2: Smaller Than One Block Upload ===');
   const size = 64 * 1024; // 64 KiB (< 256 KiB granularity and < 512 KiB chunk size)
   const payload = createTempPayload(size, 'small-block-');
@@ -176,7 +257,7 @@ async function testSmallerThanOneBlockUpload(port) {
     const session = await client.uploadMedia({
       name: path.basename(payload.filePath),
     });
-    const progressUpdates = [];
+    const progressUpdates: number[] = [];
 
     await session.start({
       uploadSource: client.getResumableSource(payload.filePath),
@@ -189,8 +270,7 @@ async function testSmallerThanOneBlockUpload(port) {
       },
     });
 
-    const response = await session.finished();
-    const uploadedSize = Number(response.size);
+    const uploadedSize = await getFinishedSize(session);
 
     assert.strictEqual(
       uploadedSize,
@@ -216,32 +296,33 @@ async function testSmallerThanOneBlockUpload(port) {
  * Wraps a PassThrough GoogleAuth instance to observe HTTP requests/responses
  * sent to gapic-showcase (and optionally mutate request headers on the fly).
  */
-function createInstrumentedAuth(onRequest) {
+function createInstrumentedAuth(onRequest?: RequestHook): {
+  auth: GoogleAuth;
+  log: RequestLogEntry[];
+} {
   const auth = new GoogleAuth({
     authClient: new googleAuthLibrary.PassThroughClient(),
   });
   const realRequest = auth.request.bind(auth);
-  const log = [];
+  const log: RequestLogEntry[] = [];
 
-  auth.request = async opts => {
-    const command = opts.headers && opts.headers['x-goog-upload-command'];
-    const rawOffset =
-      opts.headers && opts.headers['x-goog-upload-offset'] !== undefined
-        ? opts.headers['x-goog-upload-offset']
-        : -1;
-    const offset = Number(rawOffset);
+  auth.request = (async <T>(opts: Parameters<GoogleAuth['request']>[0]) => {
+    const reqOpts = opts as UploadRequestOptions;
+    const command = reqOpts.headers?.['x-goog-upload-command'];
+    const rawOffset = reqOpts.headers?.['x-goog-upload-offset'];
+    const offset = rawOffset !== undefined ? Number(rawOffset) : -1;
     if (onRequest) {
-      await onRequest(opts, {command, offset, log});
+      await onRequest(reqOpts, {command, offset, log});
     }
-    const response = await realRequest(opts);
+    const response = await realRequest<T>(opts);
     log.push({
       command,
       offset,
       status: response.status,
-      bodyLength: opts.body ? opts.body.length : 0,
+      bodyLength: reqOpts.body ? reqOpts.body.length : 0,
     });
     return response;
-  };
+  }) as GoogleAuth['request'];
 
   return {auth, log};
 }
@@ -252,7 +333,7 @@ function createInstrumentedAuth(onRequest) {
  * - Part A: `non_fatal_error_on_start` with `client_uuid`, `error_code: 503`, `failure_count: 2`
  * - Part B: `fatal_error_on_start` with `error_code: 403`
  */
-async function testStartErrorScenarios(port) {
+async function testStartErrorScenarios(port: number): Promise<void> {
   console.log(
     '\n=== Test 3: Start Error Scenarios (non_fatal_error_on_start & fatal_error_on_start) ===',
   );
@@ -289,12 +370,15 @@ async function testStartErrorScenarios(port) {
           retryDelayMultiplier: 1.2,
           maxRetryDelayMillis: 100,
           maxRetries: 4,
+          initialRpcTimeoutMillis: 0,
+          rpcTimeoutMultiplier: 1,
+          maxRpcTimeoutMillis: 0,
+          totalTimeoutMillis: 0,
         },
       },
     });
 
-    const responseA = await sessionA.finished();
-    assert.strictEqual(Number(responseA.size), size);
+    assert.strictEqual(await getFinishedSize(sessionA), size);
 
     const startCallsA = logA.filter(entry => entry.command === 'start');
     assert.strictEqual(
@@ -362,7 +446,7 @@ async function testStartErrorScenarios(port) {
  * - Part B: Category 2 state mismatch (`error_code: 412`, `failure_count: 1`, `after_offset: 256 KiB`)
  * - Part C: Session termination (`action_after_failures: "terminate"`)
  */
-async function testUploadWithFailureAndRetry(port) {
+async function testUploadWithFailureAndRetry(port: number): Promise<void> {
   console.log(
     '\n=== Test 4: Chunk Upload Failure Scenarios (non_fatal_error_on_chunk_upload) ===',
   );
@@ -375,6 +459,10 @@ async function testUploadWithFailureAndRetry(port) {
       retryDelayMultiplier: 1.2,
       maxRetryDelayMillis: 100,
       maxRetries: 3,
+      initialRpcTimeoutMillis: 0,
+      rpcTimeoutMultiplier: 1,
+      maxRpcTimeoutMillis: 0,
+      totalTimeoutMillis: 0,
     },
   };
 
@@ -405,8 +493,7 @@ async function testUploadWithFailureAndRetry(port) {
       },
     });
 
-    const responseA = await sessionA.finished();
-    assert.strictEqual(Number(responseA.size), size);
+    assert.strictEqual(await getFinishedSize(sessionA), size);
 
     const block2CallsA = logA.filter(
       entry => entry.command === 'upload' && entry.offset === GRANULARITY,
@@ -450,8 +537,7 @@ async function testUploadWithFailureAndRetry(port) {
       },
     });
 
-    const responseB = await sessionB.finished();
-    assert.strictEqual(Number(responseB.size), size);
+    assert.strictEqual(await getFinishedSize(sessionB), size);
 
     assert.ok(
       logB.some(
@@ -494,6 +580,10 @@ async function testUploadWithFailureAndRetry(port) {
           retryDelayMultiplier: 1.1,
           maxRetryDelayMillis: 30,
           maxRetries: 2,
+          initialRpcTimeoutMillis: 0,
+          rpcTimeoutMultiplier: 1,
+          maxRpcTimeoutMillis: 0,
+          totalTimeoutMillis: 0,
         },
       },
       startHeaders: {
@@ -532,7 +622,7 @@ async function testUploadWithFailureAndRetry(port) {
  * 409 Conflict when the client retries offset 0. Client queries offset (100 KiB), transmits
  * the 156 KiB tail at offset 100 KiB, and finishes the remaining blocks.
  */
-async function testPartialCommitOnChunkUpload(port) {
+async function testPartialCommitOnChunkUpload(port: number): Promise<void> {
   console.log(
     '\n=== Test 5: Partial Commit on Chunk Upload (partial_commit_on_chunk_upload) ===',
   );
@@ -556,6 +646,10 @@ async function testPartialCommitOnChunkUpload(port) {
           retryDelayMultiplier: 1.2,
           maxRetryDelayMillis: 100,
           maxRetries: 3,
+          initialRpcTimeoutMillis: 0,
+          rpcTimeoutMultiplier: 1,
+          maxRpcTimeoutMillis: 0,
+          totalTimeoutMillis: 0,
         },
       },
       startHeaders: {
@@ -569,8 +663,7 @@ async function testPartialCommitOnChunkUpload(port) {
       },
     });
 
-    const response = await session.finished();
-    assert.strictEqual(Number(response.size), size);
+    assert.strictEqual(await getFinishedSize(session), size);
 
     assert.ok(
       log.some(
@@ -619,7 +712,9 @@ async function testPartialCommitOnChunkUpload(port) {
  * - Part A: `non_fatal_error_on_query` (`error_code: 503`, `failure_count: 2`)
  * - Part B: `chunk_granularity` (server sets 256-byte granularity and rejects unaligned chunks with 400)
  */
-async function testQueryAndChunkGranularityScenarios(port) {
+async function testQueryAndChunkGranularityScenarios(
+  port: number,
+): Promise<void> {
   console.log(
     '\n=== Test 6: Query Retry & Chunk Granularity Scenarios (non_fatal_error_on_query & chunk_granularity) ===',
   );
@@ -638,7 +733,7 @@ async function testQueryAndChunkGranularityScenarios(port) {
     const sessionA1 = await clientA.uploadMedia({
       name: path.basename(payloadA.filePath),
     });
-    const oneBlockSource = {
+    const oneBlockSource: ResumableSource = {
       size: sizeA,
       getStream(offset = 0) {
         return Readable.from(
@@ -662,6 +757,7 @@ async function testQueryAndChunkGranularityScenarios(port) {
       },
     });
     const resumeUrl = sessionA1.uploadUrl;
+    assert.ok(resumeUrl, 'Expected sessionA1 to have an uploadUrl');
     await assert.rejects(sessionA1.finished(), /Stop after 1 block/);
 
     // Session 2 resumes from resumeUrl -> sends `query` which fails twice with 503 before succeeding
@@ -678,12 +774,15 @@ async function testQueryAndChunkGranularityScenarios(port) {
           retryDelayMultiplier: 1.2,
           maxRetryDelayMillis: 100,
           maxRetries: 4,
+          initialRpcTimeoutMillis: 0,
+          rpcTimeoutMultiplier: 1,
+          maxRpcTimeoutMillis: 0,
+          totalTimeoutMillis: 0,
         },
       },
     });
 
-    const responseA2 = await sessionA2.finished();
-    assert.strictEqual(Number(responseA2.size), sizeA);
+    assert.strictEqual(await getFinishedSize(sessionA2), sizeA);
 
     const queryCalls = logA.filter(entry => entry.command === 'query');
     assert.deepStrictEqual(
@@ -727,8 +826,7 @@ async function testQueryAndChunkGranularityScenarios(port) {
       `Expected session.chunkSize to be rounded down to 512 (multiple of 256), got ${sessionB.chunkSize}`,
     );
 
-    const responseB = await sessionB.finished();
-    assert.strictEqual(Number(responseB.size), sizeB);
+    assert.strictEqual(await getFinishedSize(sessionB), sizeB);
 
     const uploadLengths = logB
       .filter(
@@ -750,7 +848,7 @@ async function testQueryAndChunkGranularityScenarios(port) {
  * Test 7: Test emulating giving the resume URL to another process
  * (same process, but brand new client, session, and upload source objects)
  */
-async function testCrossProcessResume(port) {
+async function testCrossProcessResume(port: number): Promise<void> {
   console.log(
     '\n=== Test 7: Cross-Process Resume (New Objects via resumeUrl) ===',
   );
@@ -760,14 +858,14 @@ async function testCrossProcessResume(port) {
 
   // --- Process 1: Uploads 512 KiB then crashes ---
   const client1 = createClient(port);
-  let savedResumeUrl = null;
+  let savedResumeUrl = '';
 
   try {
     const session1 = await client1.uploadMedia({
       name: path.basename(payload.filePath),
     });
 
-    const crashingSource = {
+    const crashingSource: ResumableSource = {
       size,
       getStream(offset = 0) {
         return Readable.from(
@@ -793,8 +891,11 @@ async function testCrossProcessResume(port) {
       },
     });
 
+    assert.ok(
+      session1.uploadUrl,
+      'Expected session1 to have a valid uploadUrl',
+    );
     savedResumeUrl = session1.uploadUrl;
-    assert.ok(savedResumeUrl, 'Expected session1 to have a valid uploadUrl');
 
     await assert.rejects(
       session1.finished(),
@@ -819,7 +920,7 @@ async function testCrossProcessResume(port) {
     const session2 = await client2.uploadMedia({
       name: path.basename(payload.filePath),
     });
-    const process2Progress = [];
+    const process2Progress: number[] = [];
 
     await session2.start({
       uploadSource: client2.getResumableSource(payload.filePath),
@@ -833,8 +934,7 @@ async function testCrossProcessResume(port) {
       },
     });
 
-    const response2 = await session2.finished();
-    const uploadedSize = Number(response2.size);
+    const uploadedSize = await getFinishedSize(session2);
 
     assert.strictEqual(uploadedSize, size);
     assert.ok(
@@ -867,7 +967,7 @@ async function testCrossProcessResume(port) {
  *   exceeding `stallTimeoutMs` -> automatic query & stream reopen
  * - Part B: Session deadline timeout (`globalDeadlineMs`) -> manual resume via `resumeUrl`
  */
-async function testTimeoutAndResume(port) {
+async function testTimeoutAndResume(port: number): Promise<void> {
   console.log(
     '\n=== Test 8: Timeout and Resume (Server delay_ms & Global Deadline) ===',
   );
@@ -879,9 +979,8 @@ async function testTimeoutAndResume(port) {
     '  --- Part A: Server delay_ms via X-Goog-Test-Scenario-Config (Auto-Resume) ---',
   );
   let queriedAfterStall = false;
-  const {auth: stallAuth} = createInstrumentedAuth(opts => {
-    const command = opts.headers && opts.headers['x-goog-upload-command'];
-    if (command === 'query') {
+  const {auth: stallAuth} = createInstrumentedAuth((opts, {command}) => {
+    if (command === 'query' && opts.headers) {
       queriedAfterStall = true;
       // Clear server-side delay_ms on recovery query so subsequent uploads do not stall again
       opts.headers['X-Goog-Test-Scenario-Config'] = JSON.stringify({
@@ -916,8 +1015,7 @@ async function testTimeoutAndResume(port) {
       },
     });
 
-    const responseA = await sessionA.finished();
-    assert.strictEqual(Number(responseA.size), size);
+    assert.strictEqual(await getFinishedSize(sessionA), size);
     assert.ok(
       queriedAfterStall,
       'Expected client to query server offset after server delay_ms stall',
@@ -934,14 +1032,14 @@ async function testTimeoutAndResume(port) {
     '  --- Part B: Global Deadline Timeout & Manual Resume via resumeUrl ---',
   );
   const clientB1 = createClient(port);
-  let timedOutUrl = null;
+  let timedOutUrl = '';
 
   try {
     const sessionB1 = await clientB1.uploadMedia({
       name: path.basename(payload.filePath),
     });
 
-    const throttledSource = {
+    const throttledSource: ResumableSource = {
       size,
       getStream(offset = 0) {
         return Readable.from(
@@ -967,6 +1065,10 @@ async function testTimeoutAndResume(port) {
       },
     });
 
+    assert.ok(
+      sessionB1.uploadUrl,
+      'Expected sessionB1 to have a valid uploadUrl',
+    );
     timedOutUrl = sessionB1.uploadUrl;
     await assert.rejects(
       sessionB1.finished(),
@@ -990,7 +1092,7 @@ async function testTimeoutAndResume(port) {
     const sessionB2 = await clientB2.uploadMedia({
       name: path.basename(payload.filePath),
     });
-    const progressB2 = [];
+    const progressB2: number[] = [];
 
     await sessionB2.start({
       uploadSource: clientB2.getResumableSource(payload.filePath),
@@ -1004,8 +1106,7 @@ async function testTimeoutAndResume(port) {
       },
     });
 
-    const responseB2 = await sessionB2.finished();
-    assert.strictEqual(Number(responseB2.size), size);
+    assert.strictEqual(await getFinishedSize(sessionB2), size);
     assert.strictEqual(
       progressB2[0],
       GRANULARITY,
@@ -1020,7 +1121,7 @@ async function testTimeoutAndResume(port) {
   }
 }
 
-async function main() {
+async function main(): Promise<void> {
   const filePath = process.env.UPLOAD_FILE;
   const port = Number(process.env.SHOWCASE_PORT || 7469);
 
