@@ -9,21 +9,35 @@ server:
   `ResumableUploadService`, produced by the generator in this repo with
   `--resumable_upload_methods=ResumableUploadService.UploadMedia`.
 * `sample.js` — end-to-end test scenarios exercising `client.uploadMedia()`,
-  `client.getResumableSource()`, and `session.start()`:
+  `client.getResumableSource()`, `session.start()`, and all `gapic-showcase`
+  `X-Goog-Test-Scenario` / `X-Goog-Test-Scenario-Config` failure-injection modes:
   1. **Multi-block upload**: Uploads a payload spanning multiple `256 KiB`
      blocks plus a partial final block, verifying per-block progress updates and
      final size.
   2. **Smaller than one block upload**: Uploads a `64 KiB` payload in a single
      `upload, finalize` command when `chunkSize` is larger than the payload.
-  3. **Upload with failure and retry**: Injects a Category 1 transient failure
-     (`HTTP 503`) to verify exponential backoff retry, and a Category 2 state
-     mismatch (`HTTP 412`) to verify `query` command recovery against
-     `gapic-showcase`.
-  4. **Cross-process / new-object resumption**: Emulates a process crash after
+  3. **Start error scenarios (`non_fatal_error_on_start` & `fatal_error_on_start`)**:
+     Injects transient `HTTP 503` errors on `start` (isolated via `client_uuid`)
+     to verify retry with backoff, and fatal `HTTP 403` errors on `start` to
+     verify immediate rejection without retry.
+  4. **Chunk upload failure scenarios (`non_fatal_error_on_chunk_upload`)**:
+     Injects server-side Category 1 (`HTTP 503`), Category 2 (`HTTP 412` ->
+     `query` recovery), and `action_after_failures: "terminate"` (`HTTP 500`)
+     responses via `X-Goog-Test-Scenario-Config`.
+  5. **Partial commit on chunk upload (`partial_commit_on_chunk_upload`)**:
+     Injects a partial server commit (`partial_bytes`) followed by `HTTP 503`
+     and `HTTP 409 Conflict`, verifying that the client queries the server
+     offset and transmits only the uncommitted tail of the chunk.
+  6. **Query retry & chunk granularity scenarios (`non_fatal_error_on_query` & `chunk_granularity`)**:
+     Injects transient `HTTP 503` failures on `query` during session recovery,
+     and tests server-enforced `256`-byte chunk granularity rounding when an
+     unaligned `chunkSize` is supplied.
+  7. **Cross-process / new-object resumption**: Emulates a process crash after
      committing `512 KiB`, then resumes and completes the upload using a brand
      new client, session, and `ResumableSource` via `resumeUrl`.
-  5. **Timeout and resume**: Tests both in-flight stall timeout (`stallTimeoutMs`)
-     with automatic recovery/stream re-opening and global deadline timeout
+  8. **Timeout and resume (`delay_ms` & `globalDeadlineMs`)**: Tests both
+     server-injected upload delay (`delay_ms`) exceeding `stallTimeoutMs` with
+     automatic recovery/stream re-opening and global deadline timeout
      (`globalDeadlineMs`) with manual session resumption via `resumeUrl`.
 * `run.sh` — downloads/starts a gapic-showcase server, builds the local
   google-gax checkout and the generated client, then runs `sample.js`.
@@ -38,7 +52,8 @@ It assumes the monorepo dependencies have been installed (so `google-gax` and
 `gapic-tools` can be compiled locally) and requires network access the first
 time it downloads the showcase server binary.
 
-The default showcase version is `0.43.1`, the first release line that includes
-the resumable upload service middleware. Set `SHOWCASE_VERSION`, `SHOWCASE_BIN`
-(to reuse an already-downloaded binary), `SHOWCASE_PORT`, or `UPLOAD_FILE` to
-override pieces of the run.
+The default showcase version is `0.44.0`, which includes the resumable upload
+service middleware, partial commit fault injection, and server-side delay
+injection. Set `SHOWCASE_VERSION`, `SHOWCASE_BIN` (to reuse an
+already-downloaded binary), `SHOWCASE_PORT`, or `UPLOAD_FILE` to override
+pieces of the run.

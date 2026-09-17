@@ -45,7 +45,7 @@ function createTempPayload(size, prefix = 'showcase-test-') {
     cleanup() {
       try {
         fs.unlinkSync(filePath);
-      } catch {
+      } catch (_err) {
         // ignore cleanup errors
       }
     },
@@ -213,74 +213,334 @@ async function testSmallerThanOneBlockUpload(port) {
 }
 
 /**
- * Test 3: Upload with a failure and retry
- * Exercises both:
- * - Category 1 transient failure (HTTP 503) -> exponential backoff retry
- * - Category 2 state mismatch (HTTP 412 after server commit) -> server offset query recovery
+ * Wraps a PassThrough GoogleAuth instance to observe HTTP requests/responses
+ * sent to gapic-showcase (and optionally mutate request headers on the fly).
+ */
+function createInstrumentedAuth(onRequest) {
+  const auth = new GoogleAuth({
+    authClient: new googleAuthLibrary.PassThroughClient(),
+  });
+  const realRequest = auth.request.bind(auth);
+  const log = [];
+
+  auth.request = async opts => {
+    const command = opts.headers && opts.headers['x-goog-upload-command'];
+    const rawOffset =
+      opts.headers && opts.headers['x-goog-upload-offset'] !== undefined
+        ? opts.headers['x-goog-upload-offset']
+        : -1;
+    const offset = Number(rawOffset);
+    if (onRequest) {
+      await onRequest(opts, {command, offset, log});
+    }
+    const response = await realRequest(opts);
+    log.push({
+      command,
+      offset,
+      status: response.status,
+      bodyLength: opts.body ? opts.body.length : 0,
+    });
+    return response;
+  };
+
+  return {auth, log};
+}
+
+/**
+ * Test 3: non_fatal_error_on_start & fatal_error_on_start
+ * Exercises gapic-showcase start-phase failure injection via X-Goog-Test-Scenario:
+ * - Part A: `non_fatal_error_on_start` with `client_uuid`, `error_code: 503`, `failure_count: 2`
+ * - Part B: `fatal_error_on_start` with `error_code: 403`
+ */
+async function testStartErrorScenarios(port) {
+  console.log(
+    '\n=== Test 3: Start Error Scenarios (non_fatal_error_on_start & fatal_error_on_start) ===',
+  );
+  const size = GRANULARITY + 32 * 1024;
+  const payload = createTempPayload(size, 'start-scenarios-');
+
+  // --- Part A: non_fatal_error_on_start ---
+  console.log(
+    '  --- Part A: X-Goog-Test-Scenario: non_fatal_error_on_start ---',
+  );
+  const {auth: authA, log: logA} = createInstrumentedAuth();
+  const clientA = createClient(port, authA);
+  const clientUuid = `test-client-run-${process.pid}-${Date.now()}`;
+
+  try {
+    const sessionA = await clientA.uploadMedia({
+      name: path.basename(payload.filePath),
+    });
+
+    await sessionA.start({
+      uploadSource: clientA.getResumableSource(payload.filePath),
+      chunkSize: GRANULARITY,
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'non_fatal_error_on_start',
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          client_uuid: clientUuid,
+          error_code: 503,
+          failure_count: 2,
+        }),
+      },
+      retry: {
+        backoffSettings: {
+          initialRetryDelayMillis: 20,
+          retryDelayMultiplier: 1.2,
+          maxRetryDelayMillis: 100,
+          maxRetries: 4,
+        },
+      },
+    });
+
+    const responseA = await sessionA.finished();
+    assert.strictEqual(Number(responseA.size), size);
+
+    const startCallsA = logA.filter(entry => entry.command === 'start');
+    assert.strictEqual(
+      startCallsA.length,
+      3,
+      `Expected 3 start attempts (2 injected 503s + 1 success), got ${startCallsA.length}`,
+    );
+    assert.deepStrictEqual(
+      startCallsA.map(entry => entry.status),
+      [503, 503, 200],
+    );
+    console.log(
+      '  PASSED Part A: non_fatal_error_on_start retried twice after 503 and succeeded.',
+    );
+  } finally {
+    await clientA.close();
+  }
+
+  // --- Part B: fatal_error_on_start ---
+  console.log('  --- Part B: X-Goog-Test-Scenario: fatal_error_on_start ---');
+  const {auth: authB, log: logB} = createInstrumentedAuth();
+  const clientB = createClient(port, authB);
+
+  try {
+    const sessionB = await clientB.uploadMedia({
+      name: path.basename(payload.filePath),
+    });
+
+    await assert.rejects(
+      sessionB.start({
+        uploadSource: clientB.getResumableSource(payload.filePath),
+        chunkSize: GRANULARITY,
+        startHeaders: {
+          'X-Goog-Test-Scenario': 'fatal_error_on_start',
+          'X-Goog-Test-Scenario-Config': JSON.stringify({
+            error_code: 403,
+          }),
+        },
+      }),
+      /HTTP 403/,
+      'Expected sessionB.start() to reject with HTTP 403 on fatal_error_on_start',
+    );
+    await assert.rejects(sessionB.finished(), /HTTP 403/);
+
+    const startCallsB = logB.filter(entry => entry.command === 'start');
+    assert.strictEqual(
+      startCallsB.length,
+      1,
+      `Expected fatal_error_on_start not to retry (got ${startCallsB.length} calls)`,
+    );
+    assert.strictEqual(startCallsB[0].status, 403);
+    console.log(
+      '  PASSED Part B: fatal_error_on_start failed immediately with HTTP 403 without retrying.',
+    );
+  } finally {
+    payload.cleanup();
+    await clientB.close();
+  }
+}
+
+/**
+ * Test 4: non_fatal_error_on_chunk_upload
+ * Exercises gapic-showcase chunk upload failure injection via X-Goog-Test-Scenario:
+ * - Part A: Category 1 transient failure (`error_code: 503`, `failure_count: 2`, `after_offset: 256 KiB`)
+ * - Part B: Category 2 state mismatch (`error_code: 412`, `failure_count: 1`, `after_offset: 256 KiB`)
+ * - Part C: Session termination (`action_after_failures: "terminate"`)
  */
 async function testUploadWithFailureAndRetry(port) {
-  console.log('\n=== Test 3: Upload With Failure and Retry ===');
+  console.log(
+    '\n=== Test 4: Chunk Upload Failure Scenarios (non_fatal_error_on_chunk_upload) ===',
+  );
   const size = 3 * GRANULARITY; // 3 blocks of 256 KiB
   const payload = createTempPayload(size, 'retry-test-');
 
-  const baseAuth = new GoogleAuth({
-    authClient: new googleAuthLibrary.PassThroughClient(),
-  });
-  const realRequest = baseAuth.request.bind(baseAuth);
-
-  let injected503 = false;
-  let retriedAfter503 = false;
-  let injected412 = false;
-  let queriedAfter412 = false;
-
-  baseAuth.request = async opts => {
-    const command = opts.headers && opts.headers['x-goog-upload-command'];
-    const offset =
-      opts.headers && Number(opts.headers['x-goog-upload-offset'] ?? -1);
-
-    // 1. Inject Category 1 transient HTTP 503 error on first attempt of block 2 (offset 256 KiB)
-    if (command === 'upload' && offset === GRANULARITY && !injected503) {
-      injected503 = true;
-      console.log(
-        `  [Fault Injection] Returning transient HTTP 503 at offset ${offset}`,
-      );
-      return {
-        status: 503,
-        headers: {'x-goog-upload-status': 'active'},
-        arrayBuffer: async () => new ArrayBuffer(0),
-      };
-    }
-
-    if (command === 'upload' && offset === GRANULARITY && injected503) {
-      retriedAfter503 = true;
-    }
-
-    // 2. Inject Category 2 HTTP 412 state mismatch on block 3 (offset 512 KiB)
-    // Client enters RECOVERY, sends `query` to gapic-showcase to check server-committed offset,
-    // discovers offset is still 512 KiB, and retries uploading block 3.
-    if (command === 'upload' && offset === 2 * GRANULARITY && !injected412) {
-      injected412 = true;
-      console.log(
-        `  [Fault Injection] Returning HTTP 412 state mismatch at offset ${offset}`,
-      );
-      return {
-        status: 412,
-        headers: {},
-        arrayBuffer: async () => new ArrayBuffer(0),
-      };
-    }
-
-    if (command === 'query' && injected412) {
-      queriedAfter412 = true;
-      console.log(
-        '  [Recovery] Client sent query command to reconcile offset with server',
-      );
-    }
-
-    return realRequest(opts);
+  const fastRetry = {
+    backoffSettings: {
+      initialRetryDelayMillis: 20,
+      retryDelayMultiplier: 1.2,
+      maxRetryDelayMillis: 100,
+      maxRetries: 3,
+    },
   };
 
-  const client = createClient(port, baseAuth);
+  // --- Part A: Category 1 transient HTTP 503 injected by gapic-showcase ---
+  console.log(
+    '  --- Part A: non_fatal_error_on_chunk_upload (HTTP 503 transient retry) ---',
+  );
+  const {auth: authA, log: logA} = createInstrumentedAuth();
+  const clientA = createClient(port, authA);
+
+  try {
+    const sessionA = await clientA.uploadMedia({
+      name: path.basename(payload.filePath),
+    });
+
+    await sessionA.start({
+      uploadSource: clientA.getResumableSource(payload.filePath),
+      chunkSize: GRANULARITY,
+      retry: fastRetry,
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'non_fatal_error_on_chunk_upload',
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          error_code: 503,
+          failure_count: 2,
+          after_offset: GRANULARITY,
+          action_after_failures: 'succeed',
+        }),
+      },
+    });
+
+    const responseA = await sessionA.finished();
+    assert.strictEqual(Number(responseA.size), size);
+
+    const block2CallsA = logA.filter(
+      entry => entry.command === 'upload' && entry.offset === GRANULARITY,
+    );
+    assert.deepStrictEqual(
+      block2CallsA.map(entry => entry.status),
+      [503, 503, 200],
+      'Expected gapic-showcase to inject two 503 responses at offset 256 KiB before succeeding',
+    );
+    console.log(
+      '  PASSED Part A: Server-injected HTTP 503 on chunk upload retried and succeeded.',
+    );
+  } finally {
+    await clientA.close();
+  }
+
+  // --- Part B: Category 2 HTTP 412 state mismatch injected by gapic-showcase ---
+  console.log(
+    '  --- Part B: non_fatal_error_on_chunk_upload (HTTP 412 recovery via query) ---',
+  );
+  const {auth: authB, log: logB} = createInstrumentedAuth();
+  const clientB = createClient(port, authB);
+
+  try {
+    const sessionB = await clientB.uploadMedia({
+      name: path.basename(payload.filePath),
+    });
+
+    await sessionB.start({
+      uploadSource: clientB.getResumableSource(payload.filePath),
+      chunkSize: GRANULARITY,
+      retry: fastRetry,
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'non_fatal_error_on_chunk_upload',
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          error_code: 412,
+          failure_count: 1,
+          after_offset: GRANULARITY,
+          action_after_failures: 'succeed',
+        }),
+      },
+    });
+
+    const responseB = await sessionB.finished();
+    assert.strictEqual(Number(responseB.size), size);
+
+    assert.ok(
+      logB.some(
+        entry =>
+          entry.command === 'upload' &&
+          entry.offset === GRANULARITY &&
+          entry.status === 412,
+      ),
+      'Expected gapic-showcase to return HTTP 412 at offset 256 KiB',
+    );
+    assert.ok(
+      logB.some(entry => entry.command === 'query' && entry.status === 200),
+      'Expected client to send query command to gapic-showcase after HTTP 412',
+    );
+    console.log(
+      '  PASSED Part B: Server-injected HTTP 412 triggered query recovery and succeeded.',
+    );
+  } finally {
+    await clientB.close();
+  }
+
+  // --- Part C: action_after_failures: "terminate" ---
+  console.log(
+    '  --- Part C: non_fatal_error_on_chunk_upload (action_after_failures: "terminate") ---',
+  );
+  const {auth: authC, log: logC} = createInstrumentedAuth();
+  const clientC = createClient(port, authC);
+
+  try {
+    const sessionC = await clientC.uploadMedia({
+      name: path.basename(payload.filePath),
+    });
+
+    await sessionC.start({
+      uploadSource: clientC.getResumableSource(payload.filePath),
+      chunkSize: GRANULARITY,
+      retry: {
+        backoffSettings: {
+          initialRetryDelayMillis: 10,
+          retryDelayMultiplier: 1.1,
+          maxRetryDelayMillis: 30,
+          maxRetries: 2,
+        },
+      },
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'non_fatal_error_on_chunk_upload',
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          error_code: 503,
+          failure_count: 1,
+          after_offset: 0,
+          action_after_failures: 'terminate',
+        }),
+      },
+    });
+
+    await assert.rejects(
+      sessionC.finished(),
+      /Exceeded the maximum number of retries/,
+      'Expected session to reject when action_after_failures is terminate',
+    );
+    const uploadStatusesC = logC
+      .filter(entry => entry.command === 'upload')
+      .map(entry => entry.status);
+    assert.deepStrictEqual(uploadStatusesC, [503, 500, 500]);
+    console.log(
+      '  PASSED Part C: action_after_failures="terminate" returned 503 then 500 and rejected as expected.',
+    );
+  } finally {
+    payload.cleanup();
+    await clientC.close();
+  }
+}
+
+/**
+ * Test 5: partial_commit_on_chunk_upload
+ * Exercises gapic-showcase partial commit fault injection (`partial_commit_on_chunk_upload`):
+ * Server commits `partial_bytes` (100 KiB) of a 256 KiB chunk and returns 503, then returns
+ * 409 Conflict when the client retries offset 0. Client queries offset (100 KiB), transmits
+ * the 156 KiB tail at offset 100 KiB, and finishes the remaining blocks.
+ */
+async function testPartialCommitOnChunkUpload(port) {
+  console.log(
+    '\n=== Test 5: Partial Commit on Chunk Upload (partial_commit_on_chunk_upload) ===',
+  );
+  const size = 2 * GRANULARITY; // 512 KiB
+  const partialBytes = 100 * 1024; // 100 KiB partial commit
+  const payload = createTempPayload(size, 'partial-commit-');
+  const {auth, log} = createInstrumentedAuth();
+  const client = createClient(port, auth);
 
   try {
     const session = await client.uploadMedia({
@@ -298,26 +558,54 @@ async function testUploadWithFailureAndRetry(port) {
           maxRetries: 3,
         },
       },
-      onProgress: status => {
-        console.log(
-          `  [Retry-test] ${status.bytesUploaded} / ${size} bytes committed`,
-        );
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'partial_commit_on_chunk_upload',
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          partial_bytes: partialBytes,
+          error_code: 503,
+          failure_count: 1,
+          after_offset: 0,
+        }),
       },
     });
 
     const response = await session.finished();
-    const uploadedSize = Number(response.size);
+    assert.strictEqual(Number(response.size), size);
 
-    assert.strictEqual(uploadedSize, size);
-    assert.ok(injected503, 'Expected HTTP 503 fault to be injected');
-    assert.ok(retriedAfter503, 'Expected client to retry chunk after HTTP 503');
-    assert.ok(injected412, 'Expected HTTP 412 fault to be injected');
     assert.ok(
-      queriedAfter412,
-      'Expected client to send query command after HTTP 412',
+      log.some(
+        entry =>
+          entry.command === 'upload' &&
+          entry.offset === 0 &&
+          entry.status === 503,
+      ),
+      'Expected initial partial commit to return HTTP 503',
+    );
+    assert.ok(
+      log.some(
+        entry =>
+          entry.command === 'upload' &&
+          entry.offset === 0 &&
+          entry.status === 409,
+      ),
+      'Expected retry at offset 0 after partial commit to return HTTP 409 Conflict',
+    );
+    assert.ok(
+      log.some(entry => entry.command === 'query' && entry.status === 200),
+      'Expected client to query committed offset after HTTP 409 Conflict',
+    );
+    assert.ok(
+      log.some(
+        entry =>
+          entry.command === 'upload' &&
+          entry.offset === partialBytes &&
+          entry.bodyLength === GRANULARITY - partialBytes &&
+          entry.status === 200,
+      ),
+      `Expected client to transmit the remaining ${GRANULARITY - partialBytes}-byte tail at offset ${partialBytes}`,
     );
     console.log(
-      'PASSED: Upload succeeded after Category 1 retry and Category 2 recovery.',
+      'PASSED: partial_commit_on_chunk_upload recovered from partial commit and transmitted chunk tail.',
     );
   } finally {
     payload.cleanup();
@@ -326,12 +614,145 @@ async function testUploadWithFailureAndRetry(port) {
 }
 
 /**
- * Test 4: Test emulating giving the resume URL to another process
+ * Test 6: non_fatal_error_on_query & chunk_granularity
+ * Exercises the remaining two gapic-showcase scenarios:
+ * - Part A: `non_fatal_error_on_query` (`error_code: 503`, `failure_count: 2`)
+ * - Part B: `chunk_granularity` (server sets 256-byte granularity and rejects unaligned chunks with 400)
+ */
+async function testQueryAndChunkGranularityScenarios(port) {
+  console.log(
+    '\n=== Test 6: Query Retry & Chunk Granularity Scenarios (non_fatal_error_on_query & chunk_granularity) ===',
+  );
+
+  // --- Part A: non_fatal_error_on_query ---
+  console.log(
+    '  --- Part A: X-Goog-Test-Scenario: non_fatal_error_on_query ---',
+  );
+  const sizeA = 2 * GRANULARITY;
+  const payloadA = createTempPayload(sizeA, 'query-scenario-');
+  const {auth: authA, log: logA} = createInstrumentedAuth();
+  const clientA = createClient(port, authA);
+
+  try {
+    // Session 1 creates the session configured with non_fatal_error_on_query and uploads 1 block
+    const sessionA1 = await clientA.uploadMedia({
+      name: path.basename(payloadA.filePath),
+    });
+    const oneBlockSource = {
+      size: sizeA,
+      getStream(offset = 0) {
+        return Readable.from(
+          (async function* () {
+            yield payloadA.data.subarray(offset, GRANULARITY);
+            throw new Error('Stop after 1 block to trigger resume query');
+          })(),
+        );
+      },
+    };
+
+    await sessionA1.start({
+      uploadSource: oneBlockSource,
+      chunkSize: GRANULARITY,
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'non_fatal_error_on_query',
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          error_code: 503,
+          failure_count: 2,
+        }),
+      },
+    });
+    const resumeUrl = sessionA1.uploadUrl;
+    await assert.rejects(sessionA1.finished(), /Stop after 1 block/);
+
+    // Session 2 resumes from resumeUrl -> sends `query` which fails twice with 503 before succeeding
+    const sessionA2 = await clientA.uploadMedia({
+      name: path.basename(payloadA.filePath),
+    });
+    await sessionA2.start({
+      uploadSource: clientA.getResumableSource(payloadA.filePath),
+      resumeUrl,
+      chunkSize: GRANULARITY,
+      retry: {
+        backoffSettings: {
+          initialRetryDelayMillis: 20,
+          retryDelayMultiplier: 1.2,
+          maxRetryDelayMillis: 100,
+          maxRetries: 4,
+        },
+      },
+    });
+
+    const responseA2 = await sessionA2.finished();
+    assert.strictEqual(Number(responseA2.size), sizeA);
+
+    const queryCalls = logA.filter(entry => entry.command === 'query');
+    assert.deepStrictEqual(
+      queryCalls.map(entry => entry.status),
+      [503, 503, 200],
+      'Expected gapic-showcase to return two 503 responses on query before 200 OK',
+    );
+    console.log(
+      '  PASSED Part A: non_fatal_error_on_query retried query twice after 503 and resumed upload.',
+    );
+  } finally {
+    payloadA.cleanup();
+    await clientA.close();
+  }
+
+  // --- Part B: chunk_granularity ---
+  console.log('  --- Part B: X-Goog-Test-Scenario: chunk_granularity ---');
+  const sizeB = 1500; // 1500 bytes across 256-byte server granularity
+  const payloadB = createTempPayload(sizeB, 'granularity-scenario-');
+  const {auth: authB, log: logB} = createInstrumentedAuth();
+  const clientB = createClient(port, authB);
+
+  try {
+    const sessionB = await clientB.uploadMedia({
+      name: path.basename(payloadB.filePath),
+    });
+
+    // Pass an unaligned chunkSize (600 bytes); server returns X-Goog-Upload-Chunk-Granularity: 256,
+    // so client must round effective chunkSize down to 512 (2 * 256) to avoid HTTP 400 from showcase.
+    await sessionB.start({
+      uploadSource: clientB.getResumableSource(payloadB.filePath),
+      chunkSize: 600,
+      startHeaders: {
+        'X-Goog-Test-Scenario': 'chunk_granularity',
+      },
+    });
+
+    assert.strictEqual(
+      sessionB.chunkSize,
+      512,
+      `Expected session.chunkSize to be rounded down to 512 (multiple of 256), got ${sessionB.chunkSize}`,
+    );
+
+    const responseB = await sessionB.finished();
+    assert.strictEqual(Number(responseB.size), sizeB);
+
+    const uploadLengths = logB
+      .filter(
+        entry =>
+          entry.command === 'upload' || entry.command === 'upload, finalize',
+      )
+      .map(entry => entry.bodyLength);
+    assert.deepStrictEqual(uploadLengths, [512, 512, 476]);
+    console.log(
+      '  PASSED Part B: chunk_granularity rounded 600-byte chunkSize to 512 bytes and completed 1500-byte upload.',
+    );
+  } finally {
+    payloadB.cleanup();
+    await clientB.close();
+  }
+}
+
+/**
+ * Test 7: Test emulating giving the resume URL to another process
  * (same process, but brand new client, session, and upload source objects)
  */
 async function testCrossProcessResume(port) {
   console.log(
-    '\n=== Test 4: Cross-Process Resume (New Objects via resumeUrl) ===',
+    '\n=== Test 7: Cross-Process Resume (New Objects via resumeUrl) ===',
   );
   const size = 4 * GRANULARITY; // 1 MiB (4 blocks of 256 KiB)
   const crashAfterBytes = 2 * GRANULARITY; // Crash after 512 KiB (2 blocks)
@@ -440,53 +861,37 @@ async function testCrossProcessResume(port) {
 }
 
 /**
- * Test 5: Timeout and resume
+ * Test 8: Timeout and resume
  * Exercises both:
- * - Part A: In-flight stall timeout (`stallTimeoutMs`) -> automatic query & stream reopen
+ * - Part A: Server-injected delay (`X-Goog-Test-Scenario-Config: {"delay_ms": 600}`)
+ *   exceeding `stallTimeoutMs` -> automatic query & stream reopen
  * - Part B: Session deadline timeout (`globalDeadlineMs`) -> manual resume via `resumeUrl`
  */
 async function testTimeoutAndResume(port) {
-  console.log('\n=== Test 5: Timeout and Resume ===');
+  console.log(
+    '\n=== Test 8: Timeout and Resume (Server delay_ms & Global Deadline) ===',
+  );
   const size = 3 * GRANULARITY; // 768 KiB (3 blocks)
   const payload = createTempPayload(size, 'timeout-test-');
 
-  // --- Part A: In-flight stall timeout and automatic recovery ---
-  console.log('  --- Part A: In-flight Stall Timeout (Auto-Resume) ---');
-  const stallAuth = new GoogleAuth({
-    authClient: new googleAuthLibrary.PassThroughClient(),
-  });
-  const realRequest = stallAuth.request.bind(stallAuth);
-  let stalledOnce = false;
+  // --- Part A: Server-injected delay_ms triggering stallTimeoutMs and automatic recovery ---
+  console.log(
+    '  --- Part A: Server delay_ms via X-Goog-Test-Scenario-Config (Auto-Resume) ---',
+  );
   let queriedAfterStall = false;
-
-  stallAuth.request = async opts => {
+  const {auth: stallAuth} = createInstrumentedAuth(opts => {
     const command = opts.headers && opts.headers['x-goog-upload-command'];
-    const offset =
-      opts.headers && Number(opts.headers['x-goog-upload-offset'] ?? -1);
-
-    if (command === 'upload' && offset === GRANULARITY && !stalledOnce) {
-      stalledOnce = true;
-      console.log(
-        `  [Stall Injection] Delaying upload at offset ${offset} beyond stallTimeoutMs (250ms)`,
-      );
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, 1000);
-        if (opts.signal) {
-          opts.signal.addEventListener('abort', () => {
-            clearTimeout(timer);
-            reject(opts.signal.reason || new Error('Aborted due to stall'));
-          });
-        }
-      });
-    }
-
-    if (command === 'query' && stalledOnce) {
+    if (command === 'query') {
       queriedAfterStall = true;
-      console.log('  [Stall Recovery] Client queried server after stall abort');
+      // Clear server-side delay_ms on recovery query so subsequent uploads do not stall again
+      opts.headers['X-Goog-Test-Scenario-Config'] = JSON.stringify({
+        delay_ms: 0,
+      });
+      console.log(
+        '  [Stall Recovery] Client queried server after server delay_ms stall; cleared delay_ms',
+      );
     }
-
-    return realRequest(opts);
-  };
+  });
 
   const clientA = createClient(port, stallAuth);
   try {
@@ -497,7 +902,13 @@ async function testTimeoutAndResume(port) {
     await sessionA.start({
       uploadSource: clientA.getResumableSource(payload.filePath),
       chunkSize: GRANULARITY,
-      stallTimeoutMs: 250,
+      stallTimeoutMs: 200,
+      startHeaders: {
+        'X-Goog-Test-Scenario-Config': JSON.stringify({
+          delay_ms: 600,
+          after_offset: GRANULARITY,
+        }),
+      },
       onProgress: status => {
         console.log(
           `  [Stall-test] ${status.bytesUploaded} / ${size} bytes committed`,
@@ -507,13 +918,12 @@ async function testTimeoutAndResume(port) {
 
     const responseA = await sessionA.finished();
     assert.strictEqual(Number(responseA.size), size);
-    assert.ok(stalledOnce, 'Expected in-flight stall to be triggered');
     assert.ok(
       queriedAfterStall,
-      'Expected client to query server offset after stall',
+      'Expected client to query server offset after server delay_ms stall',
     );
     console.log(
-      '  PASSED Part A: In-flight stall timeout automatically recovered and finished.',
+      '  PASSED Part A: Server delay_ms stall automatically recovered and finished.',
     );
   } finally {
     await clientA.close();
@@ -620,7 +1030,10 @@ async function main() {
 
   await testMultiBlockUpload(port);
   await testSmallerThanOneBlockUpload(port);
+  await testStartErrorScenarios(port);
   await testUploadWithFailureAndRetry(port);
+  await testPartialCommitOnChunkUpload(port);
+  await testQueryAndChunkGranularityScenarios(port);
   await testCrossProcessResume(port);
   await testTimeoutAndResume(port);
 
