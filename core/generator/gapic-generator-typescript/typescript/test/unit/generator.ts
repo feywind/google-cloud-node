@@ -37,6 +37,7 @@ interface TestGenerator {
   readLegacyProtoLoad(): void;
   readRestNumericEnums(): void;
   readMixins(): void;
+  readResumableUploadMethods(): void;
   addProtosToResponse(): void;
   buildAPIObject(): API;
 }
@@ -89,10 +90,14 @@ describe('src/generator.ts', () => {
 
     it('should convert parameter keys to kebab-case', () => {
       getTestGenerator(generator).getParamMap(
-        'main_service=TestService,legacy_proto_load=true',
+        'main_service=TestService,legacy_proto_load=true,resumable_upload_methods=Svc.Method',
       );
       assert.strictEqual(generator.paramMap['main-service'], 'TestService');
       assert.strictEqual(generator.paramMap['legacy-proto-load'], 'true');
+      assert.strictEqual(
+        generator.paramMap['resumable-upload-methods'],
+        'Svc.Method',
+      );
     });
   });
 
@@ -170,6 +175,16 @@ describe('src/generator.ts', () => {
       assert.deepStrictEqual(generator.mixinsOverride, [
         'google.iam.v1.IAMPolicy',
         'google.longrunning.Operations',
+      ]);
+    });
+
+    it('should read resumable upload methods option', () => {
+      generator.paramMap['resumable-upload-methods'] =
+        ' ResumableUploadService.CreateResumableUpload ; ; OtherService.Upload ';
+      getTestGenerator(generator).readResumableUploadMethods();
+      assert.deepStrictEqual(generator.resumableUploadMethods, [
+        'ResumableUploadService.CreateResumableUpload',
+        'OtherService.Upload',
       ]);
     });
   });
