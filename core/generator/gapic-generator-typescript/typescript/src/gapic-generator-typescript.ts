@@ -142,6 +142,12 @@ async function main(processArgv: string[]) {
     )
     .string('resumable_upload_methods')
     .alias('resumable_upload_methods', 'resumable-upload-methods')
+    .describe(
+      'enable_telemetry_tracing',
+      'Set to true to generate a library instrumented with telemetry tracing.',
+    )
+    .boolean('enable-telemetry-tracing')
+    .alias('enable-telemetry-tracing', 'enable_telemetry_tracing')
     .describe('protoc', 'Path to protoc binary')
     .usage('Usage: $0 -I /path/to/googleapis')
     .usage('  --output_dir /path/to/output_directory')
